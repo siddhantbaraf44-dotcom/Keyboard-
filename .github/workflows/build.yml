@@ -1,48 +1,68 @@
-name: Build APK from ZIP
+name: Build Ice APK
 
 on:
-  push:
   workflow_dispatch:
+    inputs:
+      arch:
+        description: "Build variant"
+        default: arm64
+        type: choice
+        options:
+          - arm64
+          - arm
+          - x86_64
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.BUILD_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Find and extract project ZIP
+      - name: Free disk space
         run: |
-          ZIP=$(find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' -not -path '*/__MACOSX/*' | head -n 1)
-          if [ -z "$ZIP" ]; then echo "::error::No .zip file found in the repo"; exit 1; fi
-          echo "Using $ZIP"
-          mkdir -p /tmp/project
-          unzip -q "$ZIP" -d /tmp/project
-          SETTINGS=$(find /tmp/project -maxdepth 3 \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -not -path '*/__MACOSX/*' | head -n 1)
-          if [ -z "$SETTINGS" ]; then echo "::error::No settings.gradle(.kts) found inside the zip"; exit 1; fi
-          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune --all --force || true
+          df -h /
 
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-
-      - name: Prepare Android SDK (preinstalled on runner)
+      - name: Unzip Ice-source.zip
         run: |
-          SDKM=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -n 1)
-          yes | "$SDKM" --licenses > /dev/null || true
-          "$SDKM" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+          test -f Ice-source.zip || { echo "Ice-source.zip not found"; exit 1; }
+          mkdir ice-src
+          unzip -q Ice-source.zip -d ice-src
+          cp -a ice-src/. .
+          rm -rf ice-src
+          test -f scripts/build.sh || { echo "scripts/build.sh missing after unzip"; exit 1; }
 
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.7
+      - name: Build builder image
+        run: docker build -t ice-builder -f Containerfile .
 
-      - name: Build debug APK
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Get sources, patch and build
+        env:
+          ARCH: ${{ github.event.inputs.arch }}
         run: |
-          if [ -f ./gradlew ]; then chmod +x ./gradlew && ./gradlew assembleDebug --stacktrace
-          else gradle assembleDebug --stacktrace; fi
+          docker run --rm -v "$PWD:/app" -e IRONFOX_RELEASE=1 ice-builder /bin/bash -euxo pipefail -c "
+            ./scripts/get_sources.sh
+            ./scripts/prebuild.sh
+            ./scripts/build.sh $ARCH
+          "
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
         with:
-          name: app-debug-apk
-          path: ${{ env.PROJECT_DIR }}/**/build/outputs/apk/**/*.apk
+          name: Ice-${{ github.event.inputs.arch }}
+          path: |
+            outputs/apk/**
+            outputs/unsigned/**
+          if-no-files-found: error
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            outputs/**/*.log
+            build/**/*.log
+          if-no-files-found: ignore
